@@ -21,6 +21,15 @@ def request_OTP(request: OTP):
 
 @router.post("/register")
 def register_user(user: User):
+    if users_collection.find_one({"Email": user.Email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    if users_collection.find_one({"CNIC": user.CNIC}):
+        raise HTTPException(status_code=400, detail="CNIC already registered")
+    
+    if users_collection.find_one({"Contact_No": user.Contact_No}):
+        raise HTTPException(status_code=400, detail="Contact_No already registered")
+    
     stored = store_otp.get(user.Email)
     if not stored:
         raise HTTPException(status_code=400, detail="NO OTP FOUND")
