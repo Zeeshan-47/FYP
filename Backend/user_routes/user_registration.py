@@ -12,6 +12,10 @@ router = APIRouter()
 
 @router.post("/request-otp")
 def request_OTP(request: OTP):
+
+    if users_collection.find_one({"Email": request.Email}):
+        raise HTTPException(status_code=400, detail="Email already registered. Please login.")
+    
     otp = generate_otp()
     expiry = datetime.utcnow() + timedelta(minutes=2)
     store_otp[request.Email] = (otp, expiry)
@@ -46,5 +50,6 @@ def register_user(user: User):
     user_dict = user.dict(exclude={"otp"})
     user_dict["Password"] = hash_password(user.Password)
     result = users_collection.insert_one(user_dict)
+    
     del store_otp[user.Email]
     return {"Message": "User Registered", "id": str(result.inserted_id)}
