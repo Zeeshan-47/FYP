@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+passlib
+pymongo
+bcrypt==4.0.1
+python-dotenv
+geopy
+python-jose
+pydantic[email]
+python-multipart
