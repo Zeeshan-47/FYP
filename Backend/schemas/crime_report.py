@@ -7,12 +7,12 @@ class Witness(BaseModel):
     Name: str = Field(..., max_length=25)
     Contact_No: str = Field(..., min_length=11, max_length=11)
 
-class CrimeType(str, Enum):
-    car_theft = "Car Theft"
-    robbery = "Robbery"
-    assault = "Assault"
-    motorcycle_theft = "Motorcycle Theft"
-    mobile_snatching = "Mobile Snatching"
+#class CrimeType(str, Enum):
+ #   car_theft = "Car Theft"
+  #  robbery = "Robbery"
+   # assault = "Assault"
+    #motorcycle_theft = "Motorcycle Theft"
+    #mobile_snatching = "Mobile Snatching"
 
 class IntensityLevel(str, Enum):
     low = "Low"
@@ -20,13 +20,17 @@ class IntensityLevel(str, Enum):
     high = "High"
     critical = "Critical"
 
+class CrimeCategory(BaseModel):
+    Crime_Name: str = Field(..., min_length=1, max_length=50)
+    Intensity_Level: IntensityLevel
+
 class CrimeReport(BaseModel):
     Name: str = Field(..., min_length=1, max_length=25)
     Contact_No: str = Field(..., min_length=11, max_length=11)
-    Crime_Type: CrimeType
+    Crime_Type: str = Field(..., min_length=1, max_length=50)
     Intensity_Level: IntensityLevel
     Witness_Info: Optional[List[Witness]] = Field(default_factory=list)
-    Location: str = Field(..., max_length=25)
+    Location: str = Field(..., max_length=150)
     Latitude: float
     Longitude: float
     Timestamp: str

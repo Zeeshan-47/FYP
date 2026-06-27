@@ -12,3 +12,4 @@ print(client.server_info())
 db = client["crime-o-graphy"]
 users_collection = db["users"]
 reports_collection = db["crime-reports"]
+crime_categories_collection = db["crime_categories"]

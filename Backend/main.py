@@ -3,8 +3,18 @@ from user_routes.crimes import router as crime
 from user_routes.user_registration import router as register
 from user_routes.user_login import router as login
 from user_routes.user_forget_password import router as forgot_password
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, change "*" to your actual website URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(crime, prefix="/crime")
 app.include_router(register, prefix="/crime")
 app.include_router(login, prefix="/crime")
