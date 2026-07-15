@@ -16,6 +16,7 @@ import itertools
 from pydantic import BaseModel
 import joblib
 import google.generativeai as genai
+from google.generativeai.types import GenerationConfig
 import json
 from dotenv import load_dotenv
 import math
@@ -785,11 +786,11 @@ def _detect_anomalies():
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Using gemini-1.5-flash because it is lightning fast for this type of task
-# We force the model to output strict JSON
 model = genai.GenerativeModel(
     'gemini-2.5-flash',
-    generation_config={"response_mime_type": "application/json"}
+    generation_config=GenerationConfig(
+        response_mime_type="application/json"
+    )
 )
 
 class FIRRequest(BaseModel):
@@ -823,13 +824,12 @@ def _run_gemini_summarizer(description: str, crime_type: str):
     }}
     """
     
-    # Call Gemini API
     response = model.generate_content(prompt)
+
+    text = response.text.replace("```json", "").replace("```", "").strip()
     
-    # Parse the JSON returned by Gemini
-    ai_data = json.loads(response.text)
+    ai_data = json.loads(text)
     
-    # Return the data to the Flutter app
     return {
         "Original_Text": description,
         "Top_Intent": crime_type.upper(),
