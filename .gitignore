@@ -1,1 +1,5 @@
 Backend/.env
+.mypy_cache/
+Backend/__pycache__/
+Backend/.mypy_cache/
+Backend/saved_quetta_nlp_model/

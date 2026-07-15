@@ -10,7 +10,7 @@ geopy
 python-jose
 pydantic[email]
 python-multipart
-transformers 
 torch
 joblib 
 scikit-learn
+google-generativeai

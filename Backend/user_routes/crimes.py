@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 import os
 from db import reports_collection, users_collection, crime_categories_collection
-from collections import Counter, defaultdict
 from schemas.crime_report import CrimeReport, CrimeCategory
 from functions.login_function import get_current_user, require_admin
 from typing import Optional
@@ -9,16 +8,19 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 from sklearn.cluster import DBSCAN
-from scipy.stats import gaussian_kde
 import asyncio
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import IsolationForest
 import itertools
 from pydantic import BaseModel
-from transformers import pipeline
-import pymongo
 import joblib
+import google.generativeai as genai
+import json
+from dotenv import load_dotenv
+import math
+import requests
+
 
 
 router = APIRouter()
@@ -780,52 +782,62 @@ def _detect_anomalies():
         raise e
 
 
-nlp_classifier = pipeline("zero-shot-classification", model="typeform/distilbert-base-uncased-mnli")
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Using gemini-1.5-flash because it is lightning fast for this type of task
+# We force the model to output strict JSON
+model = genai.GenerativeModel(
+    'gemini-2.5-flash',
+    generation_config={"response_mime_type": "application/json"}
+)
 
 class FIRRequest(BaseModel):
     description: str
+    crime_type: str = "Unknown"
 
 @router.post("/analytics/analyze-fir")
 async def analyze_fir(request: FIRRequest):
     try:
-        result = await asyncio.to_thread(_run_nlp_pipeline, request.description)
+        result = await asyncio.to_thread(_run_gemini_summarizer, request.description, request.crime_type)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def _run_nlp_pipeline(text: str):
-    text_lower = text.lower()
-
-    # INTENT ANALYSIS (Local BERT Zero-Shot Classification)
-    # The AI categorize the text into one of these intents without any prior training
-    candidate_labels = ["violent intent", "armed threat", "property theft", "non-violent dispute"]
+def _run_gemini_summarizer(description: str, crime_type: str):
+    # This prompt is the "brain" of your new architecture
+    prompt = f"""
+    You are an expert police dispatcher assistant in Quetta, Pakistan. 
+    Analyze the following citizen FIR report.
     
-    classification = nlp_classifier(text, candidate_labels)
-    top_intent = classification['labels'][0]
-    confidence = classification['scores'][0]
+    Reported Category: {crime_type}
+    Citizen's Description: {description}
 
-    weapons_db = ["gun", "knife", "pistol", "rifle", "blade", "bat", "weapon", "armed", "firearm", "kalashnikov"]
-    extracted_weapons = [w for w in weapons_db if w in text_lower]
-
-    is_violent = top_intent in ["violent intent", "armed threat"] or len(extracted_weapons) > 0
+    Extract the most important information and respond ONLY in the following JSON schema:
+    {{
+        "Summary": "A concise, professional 1-2 sentence summary of what happened for the police officer to read quickly.",
+        "Extracted_Entities": ["list", "of", "weapons", "vehicles", "suspect descriptions", "locations mentioned"],
+        "Calculated_Priority": "CRITICAL (if weapons, violence, or high threat) or STANDARD",
+        "Actionable_Decision": "1 specific recommended action for the police unit.",
+        "Color_Code": "RED if CRITICAL, GREEN if STANDARD"
+    }}
+    """
     
-    if is_violent:
-        priority = "CRITICAL"
-        decision = "Automatically prioritize case involving violent intent for immediate investigator assignment."
-        color_code = "RED"
-    else:
-        priority = "STANDARD"
-        decision = "Add to standard queue for regional investigator review."
-        color_code = "GREEN"
-
+    # Call Gemini API
+    response = model.generate_content(prompt)
+    
+    # Parse the JSON returned by Gemini
+    ai_data = json.loads(response.text)
+    
+    # Return the data to the Flutter app
     return {
-        "Original_Text": text,
-        "Top_Intent": top_intent.upper(),
-        "Confidence": round(confidence * 100, 1),
-        "Extracted_Entities": extracted_weapons,
-        "Calculated_Priority": priority,
-        "Actionable_Decision": decision,
-        "Color_Code": color_code
+        "Original_Text": description,
+        "Top_Intent": crime_type.upper(),
+        "Summary": ai_data.get("Summary", "No summary generated."),
+        "Extracted_Entities": ai_data.get("Extracted_Entities", []),
+        "Calculated_Priority": ai_data.get("Calculated_Priority", "STANDARD"),
+        "Actionable_Decision": ai_data.get("Actionable_Decision", "Review manually."),
+        "Color_Code": ai_data.get("Color_Code", "GREEN")
     }
 
 
@@ -856,3 +868,170 @@ async def get_user_count():
         return {"total_users": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+def get_recent_crimes_from_db():
+    try:
+        # 1. Query: Only get reports that actually have GPS coordinates
+        query = {
+            "Latitude": {"$exists": True, "$ne": "", "$ne": None},
+            "Longitude": {"$exists": True, "$ne": "", "$ne": None}
+        }
+        
+        # 2. Projection: We ONLY fetch what the math engine needs to save RAM
+        projection = {
+            "Crime_Type": 1, 
+            "Intensity_Level": 1, 
+            "Latitude": 1, 
+            "Longitude": 1
+        }
+        
+        # 3. Fetch the latest 500 crimes to create a dense, accurate risk map
+        cursor = reports_collection.find(query, projection).sort([("Timestamp", -1)]).limit(500)
+        
+        crimes = list(cursor)
+        
+        # Safely convert ObjectIds and coordinates
+        for c in crimes:
+            c["_id"] = str(c["_id"])
+            # Ensure coordinates are floats so math.sin() doesn't crash
+            c["Latitude"] = float(c.get("Latitude", 0))
+            c["Longitude"] = float(c.get("Longitude", 0))
+            
+        return crimes
+        
+    except Exception as e:
+        print(f"Error fetching crimes for routing: {e}") 
+        return [] # Return empty list so the routing doesn't crash, it will just assume 0 risk
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel('gemini-2.5-flash')
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
+
+class RouteRequest(BaseModel):
+    source: str
+    destination: str
+    mode: str = "citizen" # 'citizen' or 'patrol'
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+def geocode_location(location_name: str):
+    # Append Quetta to improve accuracy
+    query = f"{location_name}, Quetta, Pakistan"
+    try:
+        resp = requests.get(NOMINATIM_URL, params={"q": query, "format": "json", "limit": 1}, headers={"User-Agent": "CrimeApp/1.0"}, timeout=10)
+        data = resp.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except:
+        pass
+    return None, None
+
+def get_routes_from_osrm(src_lat, src_lon, dst_lat, dst_lon):
+    try:
+        url = f"{OSRM_URL}/{src_lon},{src_lat};{dst_lon},{dst_lat}"
+        resp = requests.get(url, params={"overview": "full", "geometries": "geojson", "alternatives": "true", "steps": "false"}, timeout=15)
+        data = resp.json()
+        routes = []
+        if data.get("code") == "Ok":
+            for i, route in enumerate(data.get("routes", [])):
+                coords = [(c[1], c[0]) for c in route["geometry"]["coordinates"]] # Swap to Lat, Lon
+                routes.append({
+                    "index": i,
+                    "coords": coords,
+                    "distance_km": round(route["distance"] / 1000, 2),
+                    "duration_min": round(route["duration"] / 60, 1)
+                })
+        return routes
+    except:
+        return []
+
+def calculate_route_risk(route_coords, crimes, radius_km=0.4):
+    sample_coords = route_coords[::10] if len(route_coords) > 20 else route_coords
+    nearby_crimes = set()
+    high_priority_near = 0
+
+    for r_lat, r_lon in sample_coords:
+        for crime in crimes:
+            c_id = str(crime.get('_id', ''))
+            c_lat = float(crime.get('Latitude', 0))
+            c_lon = float(crime.get('Longitude', 0))
+            
+            if c_lat == 0 or c_lon == 0: continue
+
+            dist = haversine_distance(r_lat, r_lon, c_lat, c_lon)
+            if dist <= radius_km and c_id not in nearby_crimes:
+                nearby_crimes.add(c_id)
+                if crime.get('Intensity_Level') in ['High', 'Critical'] or crime.get('Crime_Type') in ['Assault', 'Robbery', 'Murder']:
+                    high_priority_near += 1
+
+    crime_count = len(nearby_crimes)
+    raw_score = (crime_count * 2.5) + (high_priority_near * 6.0)
+    risk_score = int(100 * (1 - math.exp(-raw_score / 50.0)))
+    return max(0, min(risk_score, 100)), crime_count, high_priority_near
+
+@router.post("/analytics/plan-route")
+async def plan_route(request: RouteRequest):
+    def process():
+        src_lat, src_lon = geocode_location(request.source)
+        dst_lat, dst_lon = geocode_location(request.destination)
+        
+        if not src_lat or not dst_lat:
+            raise ValueError("Could not find coordinates for the given locations.")
+
+        osrm_routes = get_routes_from_osrm(src_lat, src_lon, dst_lat, dst_lon)
+        crimes = get_recent_crimes_from_db() # Call your DB here
+
+        results = []
+        for r in osrm_routes:
+            score, c_count, hp_count = calculate_route_risk(r['coords'], crimes)
+            
+            if request.mode == "patrol":
+                if score >= 70: classification = {"level": "Optimal Patrol", "color": "#3b82f6"} # Blue
+                elif score >= 40: classification = {"level": "Standard Patrol", "color": "#f59e0b"} # Yellow
+                else: classification = {"level": "Low Utility", "color": "#10b981"} # Green (Safe, so low patrol utility)
+                
+                prompt = f"Analyze patrol route: {request.source} to {request.destination}. Score: {score}/100. Crimes: {c_count}. High priority: {hp_count}. Explain why it is {classification['level']} in 2 sentences."
+            else:
+                if score <= 30: classification = {"level": "Safe Route", "color": "#10b981"} # Green
+                elif score <= 60: classification = {"level": "Moderate Risk", "color": "#f59e0b"} # Yellow
+                else: classification = {"level": "High Risk - Avoid", "color": "#f43f5e"} # Red
+                
+                prompt = f"Analyze travel route: {request.source} to {request.destination}. Score: {score}/100. Crimes: {c_count}. High priority: {hp_count}. Explain why it is {classification['level']} in 2 sentences."
+
+            try:
+                ai_text = model.generate_content(prompt).text.strip()
+            except:
+                ai_text = "AI explanation unavailable at the moment."
+
+            results.append({
+                "id": r["index"],
+                "distance_km": r["distance_km"],
+                "duration_min": r["duration_min"],
+                "score": score,
+                "classification": classification["level"],
+                "color": classification["color"],
+                "crime_count": c_count,
+                "high_priority_count": hp_count,
+                "ai_explanation": ai_text,
+                "coordinates": r["coords"]
+            })
+            
+        return {
+            "source_coords": [src_lat, src_lon],
+            "dest_coords": [dst_lat, dst_lon],
+            "routes": results
+        }
+
+    try:
+        return await asyncio.to_thread(process)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
