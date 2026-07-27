@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 import os
-from db import reports_collection, users_collection, crime_categories_collection
+from db import reports_collection, users_collection, crime_categories_collection, alerts_collection
 from schemas.crime_report import CrimeReport, CrimeCategory
 from functions.login_function import get_current_user, require_admin
 from typing import Optional
@@ -431,71 +431,112 @@ def get_tactical_intelligence(
 @router.get("/analytics/map-data")
 async def get_map_data(
     crime_type: str = Query("All"),
-    intensity: str = Query("All")
+    intensity: str = Query("All"),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
 ):
     try:
+        # 1. Build Strict MongoDB Query
         query = {}
-        if crime_type != "All": query["Crime_Type"] = crime_type
-        if intensity != "All": query["Intensity_Level"] = intensity
+        if crime_type != "All": 
+            query["Crime_Type"] = crime_type
+        if intensity != "All": 
+            query["Intensity_Level"] = intensity
+            
+        # (Optional) Time-based filtering if you pass dates from Flutter
+        if start_date or end_date:
+            query["Timestamp"] = {}
+            if start_date: query["Timestamp"]["$gte"] = start_date
+            if end_date: query["Timestamp"]["$lte"] = end_date
             
         projection = {
-            "Latitude": 1, 
-            "Longitude": 1, 
-            "Crime_Type": 1, 
-            "Intensity_Level": 1, 
-            "Timestamp": 1,
-            "Location" : 1
+            "Latitude": 1, "Longitude": 1, 
+            "Crime_Type": 1, "Intensity_Level": 1, 
+            "Timestamp": 1, "Location": 1, "Description": 1
         }
         
+        # 2. Fetch from MongoDB (Async)
         cursor = reports_collection.find(query, projection)
         reports = cursor.to_list(length=None) 
 
         if not reports:
-            return[]
+            return []
         
-        valid_reports = []
-        lats =[]
-        longs =[]
+        # 3. ENTERPRISE OPTIMIZATION: Use Pandas for Vectorized Processing
+        # This is infinitely faster than Python 'for' loops for spatial data
+        df = pd.DataFrame(reports)
         
-        for r in reports:
-            lat = r.get('Latitude')
-            lon = r.get('Longitude')
-            if lat and lon and lat != 0 and lon != 0:
-                valid_reports.append(r)
-                lats.append(float(lat))
-                longs.append(float(lon))
+        # Safely force coordinates to floats. Any corrupt text/data becomes NaN
+        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
         
-        if len(lats) >= 5: # Require at least 5 crimes city-wide to bother clustering
-            coords = np.array(list(zip(lats, longs)))
+        # Drop rows where coordinates are NaN, 0, or geographically impossible
+        df = df.dropna(subset=['Latitude', 'Longitude'])
+        df = df[
+            (df['Latitude'] >= -90) & (df['Latitude'] <= 90) & 
+            (df['Longitude'] >= -180) & (df['Longitude'] <= 180) &
+            (df['Latitude'] != 0.0) & (df['Longitude'] != 0.0)
+        ]
+        
+        if df.empty:
+            return []
             
-            cluster_labels = await asyncio.to_thread(_run_dbscan, coords)
+        # 4. Extract clean coordinates as a high-speed Numpy array
+        coords = df[['Latitude', 'Longitude']].to_numpy()
+        total_points = len(coords)
+        
+        # 5. DYNAMIC DENSITY SCALING
+        # Adjust minimum cluster size based on how much data is on screen.
+        # If showing thousands of points, require 10 to form a cluster.
+        # If showing a highly filtered view, require 3.
+        if total_points > 500:
+            min_samples = 10
+        elif total_points > 100:
+            min_samples = 5
         else:
-            cluster_labels = [-1] * len(valid_reports)
- 
-        for i, report in enumerate(valid_reports):
-            report["_id"] = str(report["_id"])
-            report["cluster_id"] = int(cluster_labels[i])
-
-        return valid_reports
+            min_samples = 3
+            
+        # 6. Background Machine Learning (DBSCAN)
+        if total_points >= min_samples and min_samples > 1:
+            # Run heavy ML matrix math on a separate thread to prevent API blocking
+            cluster_labels = await asyncio.to_thread(_run_dbscan, coords, min_samples)
+            df['cluster_id'] = cluster_labels
+        else:
+            # Not enough data for AI clustering, treat all as standalone pins (-1)
+            df['cluster_id'] = -1
+            
+        # 7. Safe Serialization for Flutter
+        # Convert MongoDB ObjectIds to strings
+        df['_id'] = df['_id'].astype(str)
+        
+        # Replace any remaining NaNs (like missing Descriptions) with empty strings
+        df = df.fillna("")
+        
+        # Convert DataFrame back to a list of dicts for JSON return
+        return df.to_dict(orient='records')
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[CRITICAL ERROR] Map Data Processing: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during spatial clustering.")
 
-def _run_dbscan(coords: np.ndarray) -> list:
+def _run_dbscan(coords: np.ndarray, min_samples: int) -> list:
+    """
+    Executes Density-Based Spatial Clustering of Applications with Noise (DBSCAN).
+    Utilizes the Haversine formula for perfectly accurate spherical Earth distances.
+    """
     kms_per_radian = 6371.0088
     
-    # ML TWEAK: 0.5km (500m) radius, minimum 5 crimes to form a Hotspot
-    eps_in_radians = 0.5 / kms_per_radian 
+    # Radius threshold: 0.4km (400 meters). Perfect for neighborhood block-level accuracy.
+    eps_in_radians = 0.4 / kms_per_radian 
     
     db = DBSCAN(
         eps=eps_in_radians, 
-        min_samples=5, 
+        min_samples=min_samples, 
         metric='haversine', 
         algorithm='ball_tree'
     ).fit(np.radians(coords))
     
     return db.labels_.tolist()
-    
 
 @router.get("/analytics/dashboard-data2")
 async def get_dashboard_data2():
@@ -721,27 +762,18 @@ def _detect_anomalies():
         reports = list(cursor)
         
         if not reports:
-            return []
+            # Return any existing active alerts in DB even if no reports exist
+            return _fetch_active_alerts_from_db()
             
         df = pd.DataFrame(reports)
-        
         df = df.dropna(subset=['Timestamp', 'Location'])
-        
         df['Location'] = df['Location'].astype(str).str.lower().str.replace(' area', '').str.strip().str.title()
         
-        df['Timestamp'] = pd.to_datetime(df['Timestamp'] , format="mixed")
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], format="mixed")
         df = df.dropna(subset=['Timestamp'])
-        
         df['Date'] = df['Timestamp'].dt.date
         
-        if not df.empty:
-            latest_idx = df['Timestamp'].idxmax()
-            latest_loc = df.loc[latest_idx, 'Location']
-            latest_date = df.loc[latest_idx, 'Date']
-        
         daily_counts = df.groupby(['Location', 'Date']).size().reset_index(name='Daily_Count')
-        
-        alerts = []
         
         for loc in daily_counts['Location'].unique():
             loc_data = daily_counts[daily_counts['Location'] == loc].copy()
@@ -764,23 +796,49 @@ def _detect_anomalies():
             
             latest_record = loc_data.iloc[-1]
             
+            # --- ANOMALY DETECTED ---
             if latest_record['Anomaly'] == -1 and latest_record['Daily_Count'] > (normal_mean * 1.5):
                 spike_pct = int(((latest_record['Daily_Count'] - normal_mean) / normal_mean) * 100)
-                
-                alerts.append({
+                alert_date_str = str(latest_record['Date'])
+
+                alert_doc = {
                     "Sector": loc,
-                    "Date": str(latest_record['Date']),
+                    "Date": alert_date_str,
                     "Current_Count": int(latest_record['Daily_Count']),
                     "Normal_Baseline": round(normal_mean, 1),
                     "Spike_Percentage": spike_pct,
-                    "Decision": f"Issue a 'High Alert' notification to app users in the {loc} area."
-                })
-                
-        alerts.sort(key=lambda x: x['Spike_Percentage'], reverse=True)
-        return alerts
+                    "Decision": f"Issue a 'High Alert' notification to app users in the {loc} area.",
+                    "status": "active",
+                    "createdAt": datetime.utcnow()
+                }
+
+                # 1. UPSERT TO MONGODB:
+                # Insert ONLY if an alert for this Sector & Date does not exist yet.
+                # $setOnInsert prevents overwriting status if an admin already marked it 'resolved'.
+                alerts_collection.update_one(
+                    {"Sector": loc, "Date": alert_date_str},
+                    {"$setOnInsert": alert_doc},
+                    upsert=True
+                )
+
+        # 2. FETCH ALL ACTIVE ALERTS FROM MONGODB (WITH _id)
+        return _fetch_active_alerts_from_db()
 
     except Exception as e:
         raise e
+
+
+# Helper function to fetch active alerts from MongoDB
+def _fetch_active_alerts_from_db():
+    cursor = alerts_collection.find({"status": "active"}).sort("createdAt", -1)
+    active_alerts = list(cursor)
+    
+    # Format MongoDB ObjectId (_id) to string for Flutter JSON parsing
+    for alert in active_alerts:
+        alert["_id"] = str(alert["_id"])
+        
+    active_alerts.sort(key=lambda x: x.get("Spike_Percentage", 0), reverse=True)
+    return active_alerts
 
 
 load_dotenv()

@@ -3,3 +3,4 @@ Backend/.env
 Backend/__pycache__/
 Backend/.mypy_cache/
 Backend/saved_quetta_nlp_model/
+Backend/user_routes/__pycache__/crimes.cpython-313.pyc
