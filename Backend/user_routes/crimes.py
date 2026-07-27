@@ -436,14 +436,12 @@ async def get_map_data(
     end_date: Optional[str] = None
 ):
     try:
-        # 1. Build Strict MongoDB Query
         query = {}
         if crime_type != "All": 
             query["Crime_Type"] = crime_type
         if intensity != "All": 
             query["Intensity_Level"] = intensity
             
-        # (Optional) Time-based filtering if you pass dates from Flutter
         if start_date or end_date:
             query["Timestamp"] = {}
             if start_date: query["Timestamp"]["$gte"] = start_date
@@ -455,22 +453,18 @@ async def get_map_data(
             "Timestamp": 1, "Location": 1, "Description": 1
         }
         
-        # 2. Fetch from MongoDB (Async)
         cursor = reports_collection.find(query, projection)
         reports = cursor.to_list(length=None) 
 
         if not reports:
             return []
         
-        # 3. ENTERPRISE OPTIMIZATION: Use Pandas for Vectorized Processing
-        # This is infinitely faster than Python 'for' loops for spatial data
         df = pd.DataFrame(reports)
         
-        # Safely force coordinates to floats. Any corrupt text/data becomes NaN
         df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
         df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
         
-        # Drop rows where coordinates are NaN, 0, or geographically impossible
+        # Dropping rows where coordinates are NaN, 0, or geographically impossible
         df = df.dropna(subset=['Latitude', 'Longitude'])
         df = df[
             (df['Latitude'] >= -90) & (df['Latitude'] <= 90) & 
@@ -481,11 +475,9 @@ async def get_map_data(
         if df.empty:
             return []
             
-        # 4. Extract clean coordinates as a high-speed Numpy array
         coords = df[['Latitude', 'Longitude']].to_numpy()
         total_points = len(coords)
         
-        # 5. DYNAMIC DENSITY SCALING
         # Adjust minimum cluster size based on how much data is on screen.
         # If showing thousands of points, require 10 to form a cluster.
         # If showing a highly filtered view, require 3.
@@ -496,23 +488,20 @@ async def get_map_data(
         else:
             min_samples = 3
             
-        # 6. Background Machine Learning (DBSCAN)
+        # Background Machine Learning (DBSCAN)
         if total_points >= min_samples and min_samples > 1:
-            # Run heavy ML matrix math on a separate thread to prevent API blocking
             cluster_labels = await asyncio.to_thread(_run_dbscan, coords, min_samples)
             df['cluster_id'] = cluster_labels
         else:
             # Not enough data for AI clustering, treat all as standalone pins (-1)
             df['cluster_id'] = -1
             
-        # 7. Safe Serialization for Flutter
-        # Convert MongoDB ObjectIds to strings
         df['_id'] = df['_id'].astype(str)
         
-        # Replace any remaining NaNs (like missing Descriptions) with empty strings
+        # Replacing any remaining NaNs (like missing Descriptions) with empty strings
         df = df.fillna("")
         
-        # Convert DataFrame back to a list of dicts for JSON return
+        # Converting DataFrame back to a list of dicts for JSON return
         return df.to_dict(orient='records')
 
     except Exception as e:
@@ -762,7 +751,6 @@ def _detect_anomalies():
         reports = list(cursor)
         
         if not reports:
-            # Return any existing active alerts in DB even if no reports exist
             return _fetch_active_alerts_from_db()
             
         df = pd.DataFrame(reports)
@@ -796,7 +784,7 @@ def _detect_anomalies():
             
             latest_record = loc_data.iloc[-1]
             
-            # --- ANOMALY DETECTED ---
+            # ANOMALY DETECTION
             if latest_record['Anomaly'] == -1 and latest_record['Daily_Count'] > (normal_mean * 1.5):
                 spike_pct = int(((latest_record['Daily_Count'] - normal_mean) / normal_mean) * 100)
                 alert_date_str = str(latest_record['Date'])
@@ -812,8 +800,6 @@ def _detect_anomalies():
                     "createdAt": datetime.utcnow()
                 }
 
-                # 1. UPSERT TO MONGODB:
-                # Insert ONLY if an alert for this Sector & Date does not exist yet.
                 # $setOnInsert prevents overwriting status if an admin already marked it 'resolved'.
                 alerts_collection.update_one(
                     {"Sector": loc, "Date": alert_date_str},
@@ -821,19 +807,16 @@ def _detect_anomalies():
                     upsert=True
                 )
 
-        # 2. FETCH ALL ACTIVE ALERTS FROM MONGODB (WITH _id)
         return _fetch_active_alerts_from_db()
 
     except Exception as e:
         raise e
 
 
-# Helper function to fetch active alerts from MongoDB
 def _fetch_active_alerts_from_db():
     cursor = alerts_collection.find({"status": "active"}).sort("createdAt", -1)
     active_alerts = list(cursor)
     
-    # Format MongoDB ObjectId (_id) to string for Flutter JSON parsing
     for alert in active_alerts:
         alert["_id"] = str(alert["_id"])
         
@@ -864,7 +847,6 @@ async def analyze_fir(request: FIRRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def _run_gemini_summarizer(description: str, crime_type: str):
-    # This prompt is the "brain" of your new architecture
     prompt = f"""
     You are an expert police dispatcher assistant in Quetta, Pakistan. 
     Analyze the following citizen FIR report.
@@ -930,13 +912,11 @@ async def get_user_count():
 
 def get_recent_crimes_from_db():
     try:
-        # 1. Query: Only get reports that actually have GPS coordinates
         query = {
             "Latitude": {"$exists": True, "$ne": "", "$ne": None},
             "Longitude": {"$exists": True, "$ne": "", "$ne": None}
         }
         
-        # 2. Projection: We ONLY fetch what the math engine needs to save RAM
         projection = {
             "Crime_Type": 1, 
             "Intensity_Level": 1, 
@@ -944,15 +924,12 @@ def get_recent_crimes_from_db():
             "Longitude": 1
         }
         
-        # 3. Fetch the latest 500 crimes to create a dense, accurate risk map
         cursor = reports_collection.find(query, projection).sort([("Timestamp", -1)]).limit(500)
         
         crimes = list(cursor)
         
-        # Safely convert ObjectIds and coordinates
         for c in crimes:
             c["_id"] = str(c["_id"])
-            # Ensure coordinates are floats so math.sin() doesn't crash
             c["Latitude"] = float(c.get("Latitude", 0))
             c["Longitude"] = float(c.get("Longitude", 0))
             
@@ -960,7 +937,7 @@ def get_recent_crimes_from_db():
         
     except Exception as e:
         print(f"Error fetching crimes for routing: {e}") 
-        return [] # Return empty list so the routing doesn't crash, it will just assume 0 risk
+        return []
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.5-flash')
@@ -982,7 +959,6 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     return R * 2 * math.asin(math.sqrt(a))
 
 def geocode_location(location_name: str):
-    # Append Quetta to improve accuracy
     query = f"{location_name}, Quetta, Pakistan"
     try:
         resp = requests.get(NOMINATIM_URL, params={"q": query, "format": "json", "limit": 1}, headers={"User-Agent": "CrimeApp/1.0"}, timeout=10)
@@ -1001,7 +977,7 @@ def get_routes_from_osrm(src_lat, src_lon, dst_lat, dst_lon):
         routes = []
         if data.get("code") == "Ok":
             for i, route in enumerate(data.get("routes", [])):
-                coords = [(c[1], c[0]) for c in route["geometry"]["coordinates"]] # Swap to Lat, Lon
+                coords = [(c[1], c[0]) for c in route["geometry"]["coordinates"]]
                 routes.append({
                     "index": i,
                     "coords": coords,
@@ -1046,22 +1022,22 @@ async def plan_route(request: RouteRequest):
             raise ValueError("Could not find coordinates for the given locations.")
 
         osrm_routes = get_routes_from_osrm(src_lat, src_lon, dst_lat, dst_lon)
-        crimes = get_recent_crimes_from_db() # Call your DB here
+        crimes = get_recent_crimes_from_db()
 
         results = []
         for r in osrm_routes:
             score, c_count, hp_count = calculate_route_risk(r['coords'], crimes)
             
             if request.mode == "patrol":
-                if score >= 70: classification = {"level": "Optimal Patrol", "color": "#3b82f6"} # Blue
-                elif score >= 40: classification = {"level": "Standard Patrol", "color": "#f59e0b"} # Yellow
-                else: classification = {"level": "Low Utility", "color": "#10b981"} # Green (Safe, so low patrol utility)
+                if score >= 70: classification = {"level": "Optimal Patrol", "color": "#3b82f6"}
+                elif score >= 40: classification = {"level": "Standard Patrol", "color": "#f59e0b"}
+                else: classification = {"level": "Low Utility", "color": "#10b981"}
                 
                 prompt = f"Analyze patrol route: {request.source} to {request.destination}. Score: {score}/100. Crimes: {c_count}. High priority: {hp_count}. Explain why it is {classification['level']} in 2 sentences."
             else:
-                if score <= 30: classification = {"level": "Safe Route", "color": "#10b981"} # Green
-                elif score <= 60: classification = {"level": "Moderate Risk", "color": "#f59e0b"} # Yellow
-                else: classification = {"level": "High Risk - Avoid", "color": "#f43f5e"} # Red
+                if score <= 30: classification = {"level": "Safe Route", "color": "#10b981"}
+                elif score <= 60: classification = {"level": "Moderate Risk", "color": "#f59e0b"}
+                else: classification = {"level": "High Risk - Avoid", "color": "#f43f5e"}
                 
                 prompt = f"Analyze travel route: {request.source} to {request.destination}. Score: {score}/100. Crimes: {c_count}. High priority: {hp_count}. Explain why it is {classification['level']} in 2 sentences."
 
